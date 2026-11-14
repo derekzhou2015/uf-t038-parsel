@@ -9,7 +9,6 @@ import re
 import typing
 import warnings
 from functools import lru_cache
-from io import BytesIO
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -112,7 +111,17 @@ def _root_from_decoded_body(
     )
 
 
-_XML_DECLARATION = re.compile(r"[\s\ufeff]*<\?xml\s")
+_BOM = chr(0xFEFF)
+# Characters that may precede the content of a document.
+_LEADING_IGNORED = re.compile("[\\s\\ufeff]*")
+# Only an XML declaration is a strong enough hint that input is XML.
+_XML_DECLARATION_START = "<?xml"
+_XML_DECLARATION = re.compile(
+    _LEADING_IGNORED.pattern + re.escape(_XML_DECLARATION_START) + r"\s"
+)
+# The number of bytes type detection tries to decide from before it decodes
+# the whole body.
+_DETECTION_BYTES = 256
 
 
 def _detect_xml_or_html(text: str) -> str:
@@ -352,58 +361,113 @@ class SelectorList(list[_SelectorType]):
 
 _NOT_SET = object()
 
+# The shortest start of an XML declaration that no other content starts with:
+# "<?xml" alone may still continue in other ways, but "<?xml " cannot.
+_XML_DECLARATION_MARKER = _XML_DECLARATION_START + " "
 
-def _get_root_from_text(text: str, *, type_: str, **lxml_kwargs: Any) -> etree._Element:
-    return create_root_node(text, _ctgroup[type_]["_parser"], **lxml_kwargs)
+
+def _is_decided(prefix: str) -> bool:
+    """Return whether the start of the document in *prefix* decides its type.
+
+    A prefix made up of ignorable characters only does not, and neither does
+    one that may still grow into an XML declaration, e.g. ``<`` or ``<?xm``.
+    """
+    rest = _LEADING_IGNORED.sub("", prefix, count=1)
+    return bool(rest) and not (
+        len(rest) < len(_XML_DECLARATION_MARKER)
+        and _XML_DECLARATION_MARKER.startswith(rest)
+    )
 
 
-def _get_root_and_type_from_bytes(
-    body: bytes,
-    encoding: str,
+def _may_be_json(prefix: str) -> bool:
+    """Return whether *prefix* may start a JSON object or array."""
+    rest = _LEADING_IGNORED.sub("", prefix, count=1)
+    # Without the rest of the document, the first character may still be
+    # missing, or the prefix may end in the middle of a multibyte character,
+    # which decoding with errors ignored drops together with the ones before.
+    return rest[:1] in ("{", "[") or not rest
+
+
+def _detection_prefix(body: bytes, encoding: str) -> str:
+    """Return the decoded start of *body* that is enough to detect its type.
+
+    Decoding with errors ignored also drops a character that the end of the
+    prefix cuts in two; the whole body is decoded later, once detection needs
+    it. Detection of large documents stays cheap, as a prefix that starts with
+    markup decides the type at once.
+    """
+    limit = _DETECTION_BYTES
+    while True:
+        prefix = body[:limit].decode(encoding, "ignore")
+        if len(body) <= limit or _is_decided(prefix):
+            return prefix
+        limit *= 2
+
+
+def _get_root_and_type(
+    text: str | None = None,
     *,
     input_type: str | None,
+    body: bytes | None = None,
+    encoding: str = "utf-8",
     **lxml_kwargs: Any,
 ) -> tuple[Any, str]:
-    if input_type == "text":
-        return body.decode(encoding), input_type
-    if input_type in ("json", None) and codecs.lookup(encoding).name == "utf-8":
-        try:
-            data = json.load(BytesIO(body))
-        except ValueError:
-            data = _NOT_SET
-        if data is not _NOT_SET and (input_type == "json" or _is_json_document(data)):
-            return data, "json"
-    if input_type == "json":
-        return None, "json"
-    assert input_type in ("html", "xml", None)  # nosec
-    type_ = input_type or _detect_xml_or_html(body[:256].decode(encoding, "ignore"))
-    root = create_root_node(
-        text="",
-        body=body,
-        encoding=encoding,
-        parser_cls=_ctgroup[type_]["_parser"],
-        **lxml_kwargs,
-    )
-    return root, type_
+    """Return the root object and the type of the input.
 
+    Exactly one of *text* and *body* is given. Detection runs on decoded
+    input, so both input forms get the same type: *body* is decoded using
+    *encoding*, strictly for ``"text"`` input, whose content is returned as
+    is, and with undecodable bytes replaced otherwise, which is what the
+    parser sees for those bytes too.
 
-def _get_root_and_type_from_text(
-    text: str, *, input_type: str | None, **lxml_kwargs: Any
-) -> tuple[Any, str]:
+    Only the material handed over to lxml differs, text or the original
+    bytes, the latter so that lxml can honor the encoding declaration of the
+    document.
+    """
     if input_type == "text":
+        if body is not None:
+            return body.decode(encoding), input_type
         return text, input_type
+    prefix = ""
     if input_type in ("json", None):
-        try:
-            data = json.loads(text)
-        except ValueError:
-            data = _NOT_SET
-        if data is not _NOT_SET and (input_type == "json" or _is_json_document(data)):
-            return data, "json"
+        if input_type == "json":
+            may_be_json = True
+        else:
+            prefix = text if body is None else _detection_prefix(body, encoding)
+            may_be_json = _may_be_json(prefix)
+        if may_be_json:
+            # The whole document is needed to validate it, so it is decoded
+            # only once its start shows that it may be JSON.
+            if body is None:
+                assert text is not None  # nosec
+                document = text
+            else:
+                document = body.decode(encoding, "replace")
+            # A leading byte order mark is not part of the document.
+            document = document.removeprefix(_BOM)
+            try:
+                data = json.loads(document)
+            except ValueError:
+                data = _NOT_SET
+            if data is not _NOT_SET and (
+                input_type == "json" or _is_json_document(data)
+            ):
+                return data, "json"
     if input_type == "json":
         return None, "json"
-    assert input_type in ("html", "xml", None)  # nosec
-    type_ = input_type or _detect_xml_or_html(text)
-    root = _get_root_from_text(text, type_=type_, **lxml_kwargs)
+    type_ = input_type or _detect_xml_or_html(prefix)
+    parser_cls = _ctgroup[type_]["_parser"]
+    if body is not None:
+        root = create_root_node(
+            text="",
+            body=body,
+            encoding=encoding,
+            parser_cls=parser_cls,
+            **lxml_kwargs,
+        )
+    else:
+        assert text is not None  # nosec
+        root = create_root_node(text, parser_cls, **lxml_kwargs)
     return root, type_
 
 
@@ -602,7 +666,7 @@ class Selector:
                 msg = f"text argument should be of type str, got {text.__class__}"
                 raise TypeError(msg)
 
-            root, type = _get_root_and_type_from_text(  # noqa: A001
+            root, type = _get_root_and_type(  # noqa: A001
                 text,
                 input_type=type,
                 base_url=base_url,
@@ -614,7 +678,7 @@ class Selector:
             if not isinstance(body, (bytes, bytearray)):
                 msg = f"body argument should be of type bytes or bytearray, got {body.__class__}"
                 raise TypeError(msg)
-            root, type = _get_root_and_type_from_bytes(  # noqa: A001
+            root, type = _get_root_and_type(  # noqa: A001
                 body=bytes(body),
                 encoding=encoding,
                 input_type=type,

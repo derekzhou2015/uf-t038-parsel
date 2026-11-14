@@ -4,7 +4,7 @@ import json
 from typing import Any, TypeAlias
 
 import pytest
-from hypothesis import assume, example, given
+from hypothesis import example, given
 from hypothesis import strategies as st
 
 from parsel import Selector
@@ -30,13 +30,6 @@ trees: st.SearchStrategy[_Tree] = st.recursive(
     lambda children: st.lists(children, max_size=3),
     max_leaves=12,
 )
-
-
-def _is_json_document(text: str) -> bool:
-    try:
-        return isinstance(json.loads(text), (dict, list))
-    except ValueError:
-        return False
 
 
 @pytest.mark.xfail(
@@ -65,9 +58,6 @@ def test_text_vs_body_other_encodings(encoding: str, data: st.DataObject) -> Non
     text = data.draw(
         st.text(st.characters(codec=encoding, exclude_characters="\ufffe"), min_size=1)
     )
-    # JSON is only detected in UTF-8 bodies, test_json_body_any_encoding()
-    # covers JSON with other encodings.
-    assume(not _is_json_document(text))
     sel_text = Selector(text=text)
     sel_body = Selector(body=text.encode(encoding), encoding=encoding)
     assert sel_text.type == sel_body.type
@@ -75,20 +65,7 @@ def test_text_vs_body_other_encodings(encoding: str, data: st.DataObject) -> Non
 
 
 @pytest.mark.parametrize(
-    "encoding",
-    [
-        "utf-8",
-        *(
-            pytest.param(
-                encoding,
-                marks=pytest.mark.xfail(
-                    reason="JSON is only parsed from UTF-8 bodies, other encodings give a None root",
-                    strict=True,
-                ),
-            )
-            for encoding in ("utf-8-sig", "utf-16", "latin-1")
-        ),
-    ],
+    "encoding", ["utf-8", "utf-8-sig", "utf-16", "utf-16-le", "latin-1"]
 )
 @given(obj=json_documents)
 @example(obj={})
@@ -120,19 +97,7 @@ def test_json_explicit_type_roundtrip(obj: object) -> None:
         assert sel.root == obj
 
 
-@pytest.mark.parametrize(
-    "from_body",
-    [
-        pytest.param(
-            False,
-            marks=pytest.mark.xfail(
-                reason="JSON detection from text= does not skip a BOM",
-                strict=True,
-            ),
-        ),
-        True,
-    ],
-)
+@pytest.mark.parametrize("from_body", [False, True])
 @given(json_documents)
 @example({})
 def test_json_detection_bom(from_body: bool, obj: object) -> None:

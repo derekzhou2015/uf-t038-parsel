@@ -3,6 +3,15 @@
 History
 -------
 
+(unreleased)
+~~~~~~~~~~~~
+
+* ``Selector`` now detects the type of ``body`` input in the same way as that
+  of the equivalent ``text`` input, for any encoding. Before, JSON was only
+  detected in UTF-8 bodies, so JSON input in UTF-16 or other encodings was
+  parsed as HTML, and an XML declaration was only detected when the first 256
+  bytes could be decoded on their own.
+
 1.12.1 (2026-09-28)
 ~~~~~~~~~~~~~~~~~~~
 

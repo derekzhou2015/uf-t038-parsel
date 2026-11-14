@@ -1483,6 +1483,125 @@ class TestExsltBytes(TestExslt):
     sscls = SelectorBytesInput  # type: ignore[assignment]
 
 
+ENCODINGS = [
+    "utf-8",
+    "utf-8-sig",
+    "utf-16",
+    "utf-16-le",
+    "utf-16-be",
+    "utf-32",
+    "iso-8859-1",
+    "cp1252",
+]
+
+DETECTION_DOCUMENTS = [
+    pytest.param("<html><body><p>oh\xa1</p></body></html>", "html", id="html"),
+    pytest.param(
+        '<?xml version="1.0"?><Doc><Title>oh\xa1</Title></Doc>',
+        "xml",
+        id="xml",
+    ),
+    pytest.param('{"a": "oh\xa1"}', "json", id="json-object"),
+    pytest.param('  [1, "oh\xa1"]\n', "json", id="json-array"),
+    pytest.param("plain text", "html", id="text"),
+]
+
+
+class TestInputFormConsistency:
+    """Bytes input must be classified like the equivalent text input."""
+
+    @pytest.mark.parametrize("encoding", ENCODINGS)
+    @pytest.mark.parametrize(("text", "expected_type"), DETECTION_DOCUMENTS)
+    def test_type_and_root_agree(
+        self, encoding: str, text: str, expected_type: str
+    ) -> None:
+        from_text = Selector(text=text)
+        from_body = Selector(body=text.encode(encoding), encoding=encoding)
+        assert from_text.type == from_body.type == expected_type
+        assert from_text.get() == from_body.get()
+
+    @pytest.mark.parametrize(
+        ("encoding", "text"),
+        [
+            ("utf-8", "<html><body><p>café</p></body></html>"),
+            ("utf-16", "<html><body><p>café</p></body></html>"),
+            ("iso-8859-1", "<html><body><p>café</p></body></html>"),
+            ("cp1252", "<html><body><p>café</p></body></html>"),
+            ("shift_jis", "<html><body><p>日本語</p></body></html>"),
+            ("euc-jp", "<html><body><p>日本語</p></body></html>"),
+        ],
+    )
+    def test_non_ascii_content_agrees(self, encoding: str, text: str) -> None:
+        expected = text.split("<p>")[1].split("</p>")[0]
+        from_text = Selector(text=text)
+        from_body = Selector(body=text.encode(encoding), encoding=encoding)
+        assert from_text.type == from_body.type == "html"
+        assert from_text.css("p::text").get() == expected
+        assert from_body.css("p::text").get() == expected
+
+    @pytest.mark.parametrize(
+        "encoding", ["utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-8-sig"]
+    )
+    def test_json_detected_from_non_utf8_bytes(self, encoding: str) -> None:
+        body = '{"a": [1, "b"]}'.encode(encoding)
+        selector = Selector(body=body, encoding=encoding)
+        assert selector.type == "json"
+        assert selector.root == {"a": [1, "b"]}
+        assert selector.jmespath("a[0]").get() == 1
+
+    @pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "latin-1"])
+    def test_explicit_json_type_from_any_encoding(self, encoding: str) -> None:
+        body = '{"a": "b"}'.encode(encoding)
+        selector = Selector(body=body, encoding=encoding, type="json")
+        assert selector.type == "json"
+        assert selector.root == {"a": "b"}
+
+    @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "iso-8859-1"])
+    def test_xml_declaration_detected_from_bytes(self, encoding: str) -> None:
+        text = '<?xml version="1.0"?><Doc><Title>Hi</Title></Doc>'
+        selector = Selector(body=text.encode(encoding), encoding=encoding)
+        assert selector.type == "xml"
+        assert selector.xpath("//Title/text()").get() == "Hi"
+
+    @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "utf-16-be"])
+    def test_detection_prefix_grows_past_whitespace(self, encoding: str) -> None:
+        """Type detection must not depend on where the first 256 bytes end."""
+        text = " " * 300 + '<?xml version="1.0"?><Doc><Title>Hi</Title></Doc>'
+        selector = Selector(body=text.encode(encoding), encoding=encoding)
+        assert selector.type == "xml"
+        assert selector.xpath("//Title/text()").get() == "Hi"
+
+    @pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
+    def test_json_detected_with_bom(self, encoding: str) -> None:
+        text = '{"a": "b"}'
+        selector = Selector(body=text.encode(encoding), encoding=encoding)
+        assert selector.type == "json"
+        assert selector.root == {"a": "b"}
+
+    @pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16"])
+    def test_text_and_body_agree_with_bom(self, encoding: str) -> None:
+        text = '{"a": "b"}'
+        bom_text = chr(0xFEFF) + text
+        from_text = Selector(text=bom_text)
+        from_body = Selector(body=text.encode(encoding), encoding=encoding)
+        assert from_text.type == from_body.type == "json"
+        assert from_text.root == from_body.root == {"a": "b"}
+
+    @pytest.mark.parametrize("encoding", ["utf-8", "utf-16"])
+    @pytest.mark.parametrize("type_", ["html", "xml", "text"])
+    def test_explicit_type_from_bytes(self, encoding: str, type_: str) -> None:
+        text = "<a><b>oh\xa1</b></a>"
+        selector = Selector(
+            body=text.encode(encoding), encoding=encoding, type=type_  # type: ignore[arg-type]
+        )
+        assert selector.type == type_
+        if type_ == "text":
+            # bytes input for "text" is returned decoded, as it is.
+            assert selector.get() == text
+        else:
+            assert selector.css("b::text").get() == "oh\xa1"
+
+
 def test_repeated_queries_do_not_leak_memory() -> None:
     tracemalloc = pytest.importorskip("tracemalloc")
     text = "<html><body>" + '<p class="a">a</p>' * 20 + "</body></html>"
